@@ -20,10 +20,18 @@
                            (cstring/split #"\s*,\s*"))]
     (set (map parse-selector-part selector-parts))))
 
+(defn- fix-sina-img-src
+  "Sina blog hide real image src in attribute real_src, this tranformation fix it."
+  [dom]
+  (enlive/transform dom
+                    [[:img (enlive/attr? :real_src)]]
+                    (fn [matched]
+                      (let [real-src (-> matched :attrs :real_src)]
+                        (assoc-in matched [:attrs :src] real-src)))))
+
 (defn- extract-single-article
-  [url-title content-selector & title-selector]
-  (let [[url t] url-title
-        dom (-> url java.net.URL. enlive/html-resource)
+  [[url t] content-selector & title-selector]
+  (let [dom (-> url java.net.URL. enlive/html-resource)
         title (or t
                   (-> dom
                       (enlive/select title-selector)
@@ -32,6 +40,7 @@
                   nil)
         content (apply str (-> dom
                                (enlive/select content-selector)
+                               fix-sina-img-src
                                enlive/emit*))]
     [content title]))
 
