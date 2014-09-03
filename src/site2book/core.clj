@@ -1,6 +1,8 @@
 (ns site2book.core
   (:require [net.cgrand.enlive-html :as enlive])
   (:require [clojure.string :as cstring])
+  (:require [clojure.java.io :as io])
+  (:require [clojure.java.shell :as shell])
   (:require [clojure.tools.cli :refer [parse-opts]])
   (:gen-class))
 
@@ -21,6 +23,15 @@
     (.toString
      (new java.math.BigInteger 1 (.digest hash-bytes)) ; Positive and the size of the number
      16)))
+
+(defn- resolve-path
+  "if other-path is absolute path, return other-path as a file. Otherwise return (clojure.java.io/file base-path otherwise)"
+  [base-path other-path]
+  (let [base-file (io/as-file base-path)
+        other-file (io/as-file other-path)]
+    (if (.isAbsolute other-file)
+      other-file
+      (io/file base-file other-file))))
 
 ;;functions to parse string to enlive selector
 (defn- parse-selector-part
@@ -53,12 +64,12 @@
   "atom of vector to hold file downloading instances created by `future`"
   (atom []))
 
-(def image-folder
+(def book-folder
   "temp folder to store downloaded images"
   (let [tmp-folder (io/file (System/getProperty "java.io.tmpdir"))
-        image-folder (io/file tmp-folder (str (java.util.UUID/randomUUID)))]
-    (.mkdir image-folder)
-    image-folder))
+        book-folder (io/file tmp-folder (str (java.util.UUID/randomUUID)))]
+    (.mkdir book-folder)
+    book-folder))
 
 (defn- download-images-for-article
   "download images in article to local and replace image links to local ones"
@@ -67,10 +78,10 @@
                     [[:img (enlive/attr? :src)]]
                     (fn [matched]
                       (let [src (-> matched :attrs :src)
-                            file-name (io/file folder (str (md5 src) ".jpg"))]
+                            file-name  (str (md5 src) ".jpg")]
                         (swap! file-downloading-instances
                                conj
-                               (future (download-file src file-name)))
+                               (future (download-file src (io/file folder file-name))))
                         (assoc-in matched [:attrs :src] file-name)))))
 
 (defn- extract-single-article
@@ -85,7 +96,7 @@
         content (apply str (-> dom
                                (enlive/select content-selector)
                                fix-sina-img-src
-                               (download-images-for-article image-folder)
+                               (download-images-for-article book-folder)
                                enlive/emit*))]
     [content title]))
 
@@ -139,6 +150,13 @@
 (def cli-options
   [["-u" "--url URL" "URL of the table of content page, multiple URLs can be splited by '|'."
     :parse-fn #(cstring/split % #"\s*\|\s*")]
+   ["-o" "--output OUTPUT" "name of generated book"
+    :default "site2book-output.mobi"
+    :parse-fn #(if (-> % (.toLowerCase) (.endsWith ".mobi"))
+                 %
+                 (str % ".mobi"))]
+   ["-a" "--author AUTHOR" "specifiy the author of this book."
+    :default "佚名"]
    ["-i" "--item-selector SELECTOR" "CSS selector to select item link in TOC page."
     :default #{[:.articleCell :.atc_title :a]}
     :parse-fn str->selector]
@@ -154,8 +172,33 @@
    ["-r" "--reverse-toc" "Build the table of content of output html in reverse order. Use this option if the input table of content pages list articles in a reverse order."]])
 
 (defn -main [& args]
-  (let [{{:keys [url item-selector title-selector content-selector limit reverse-toc]} :options} (parse-opts args cli-options)]
-    (spit "1.html" (-> url
-                       (extract-article-list item-selector limit reverse-toc)
-                       (extract-articles content-selector title-selector)))))
+  (let [options (:options (parse-opts args cli-options))
+        {:keys [url output author item-selector title-selector content-selector limit reverse-toc]} options
+        book-title (first (cstring/split output #"\.")) ;;set title as output without extension name
+        output-full-name (resolve-path (System/getProperty "user.dir")
+                                       output)
+        html-file-path (.getAbsolutePath (io/file book-folder "1.html"))]
+    (spit html-file-path
+          (-> url
+              (extract-article-list item-selector limit reverse-toc)
+              (extract-articles content-selector title-selector)))
+    ;;wait for all downloading job finished
+    (doseq [job @file-downloading-instances]
+      (try
+        @job
+        (catch Exception e
+          (println (str "error while downloading image : "
+                        (.getMessage e))))))
+    (let [{:keys [exit out err]} (shell/sh "ebook-convert"
+                                           (str "\"" html-file-path "\"")
+                                           (str "\"" output-full-name "\"")
+                                           "--title"
+                                           book-title
+                                           "--authors"
+                                           author)]
+      (if (not (empty? err))
+        (do
+          (println "Something went wrong.")
+          (println err)
+          (println "Html file generated at " html-file-path))))))
 
